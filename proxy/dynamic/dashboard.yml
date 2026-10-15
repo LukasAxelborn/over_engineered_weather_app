@@ -1,0 +1,11 @@
+# Traefik dashboard, exposed over HTTPS behind basic auth.
+http:
+  routers:
+    dashboard:
+      rule: "Host(`traefik.local`)"
+      entryPoints:
+        - websecure
+      service: api@internal
+      middlewares:
+        - dashboard-auth@file
+      tls: {}

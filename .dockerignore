@@ -1,0 +1,21 @@
+# Keep the build context small and avoid leaking secrets / irrelevant files.
+.git
+.github
+.gitignore
+.env
+.env.example
+*.md
+session-*.md
+**/__pycache__
+**/*.pyc
+**/.venv
+**/venv
+**/node_modules
+proxy/certs
+proxy/dynamic/users
+observability
+ops
+db
+Makefile
+compose.yaml
+compose*.yml

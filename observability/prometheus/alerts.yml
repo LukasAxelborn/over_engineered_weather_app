@@ -1,0 +1,64 @@
+groups:
+  - name: weather
+    rules:
+      - alert: InstanceDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} target is down"
+          description: "Prometheus cannot scrape {{ $labels.instance }} (job {{ $labels.job }})."
+
+      - alert: ApiHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="weather-api", status=~"5.."}[5m]))
+            /
+          sum(rate(http_requests_total{job="weather-api"}[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Weather API 5xx error rate > 5%"
+          description: "5xx ratio is {{ $value | humanizePercentage }} over the last 5m."
+
+      - alert: ApiHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket{job="weather-api"}[5m])) by (le)
+          ) > 1.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Weather API p95 latency > 1.5s"
+          description: "p95 is {{ $value }}s."
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is down"
+          description: "redis_exporter reports redis_up == 0."
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Postgres is down"
+          description: "postgres_exporter reports pg_up == 0."
+
+      - alert: HostLowDisk
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint="/"}
+            / node_filesystem_size_bytes{mountpoint="/"}) < 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Root filesystem < 10% free"
+          description: "Only {{ $value | humanizePercentage }} free on /."

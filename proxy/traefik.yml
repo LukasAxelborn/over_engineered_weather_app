@@ -1,0 +1,51 @@
+# Traefik v3 static configuration.
+# Includes:
+#   - web (:80) -> redirect to websecure (:443)
+#   - websecure (:443) with file-provided local-CA certificates
+#   - Docker provider (exposedByDefault=false; routes opt-in via labels)
+#   - File provider for TLS store, middlewares, dashboard router
+#   - Prometheus metrics for the observability profile
+
+api:
+  dashboard: true
+  insecure: false
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    # endpoint intentionally omitted so Traefik uses DOCKER_HOST/DOCKER_API_VERSION
+    # from the environment (Docker 29 requires API >= 1.40).
+    exposedByDefault: false
+    network: edge
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+log:
+  level: INFO
+
+accessLog: {}
+
+metrics:
+  prometheus:
+    addEntryPointsLabels: true
+    addServicesLabels: true
+    addRoutersLabels: true
+    buckets:
+      - 0.05
+      - 0.1
+      - 0.25
+      - 0.5
+      - 1.0
+      - 2.5

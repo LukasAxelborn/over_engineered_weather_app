@@ -1,0 +1,10 @@
+# TLS store: serve the local-CA leaf certificate for all HTTPS routers.
+tls:
+  certificates:
+    - certFile: /certs/weather.crt
+      keyFile: /certs/weather.key
+  options:
+    default:
+      minVersion: VersionTLS12
+      # Uncomment for added strictness once clients support it:
+      # sniStrict: true

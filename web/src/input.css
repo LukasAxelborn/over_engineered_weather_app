@@ -1,0 +1,7 @@
+/* Tailwind entry point.
+ * Custom component CSS (glass, shimmer, theme overrides) stays inline in
+ * index.html to preserve its cascade/!important behaviour.
+ */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

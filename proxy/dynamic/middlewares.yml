@@ -1,0 +1,39 @@
+# Reusable HTTP middlewares, referenced from Docker labels as <name>@file.
+http:
+  middlewares:
+    secure-headers:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        forceSTSHeader: true
+        contentTypeNosniff: true
+        frameDeny: true
+        referrerPolicy: strict-origin-when-cross-origin
+        permissionsPolicy: "geolocation=(self), microphone=(), camera=()"
+        customResponseHeaders:
+          X-Powered-By: ""
+        hostsProxyHeaders:
+          - "X-Forwarded-Host"
+
+    compress:
+      compress: {}
+
+    api-rate-limit:
+      rateLimit:
+        average: 100
+        burst: 50
+        period: 1s
+        sourceCriterion:
+          requestHeaderName: X-Device-Id
+
+    # Applied to the public search endpoints only.
+    public-rate-limit:
+      rateLimit:
+        average: 30
+        burst: 20
+        period: 1s
+
+    dashboard-auth:
+      basicAuth:
+        usersFile: /etc/traefik/dynamic/users

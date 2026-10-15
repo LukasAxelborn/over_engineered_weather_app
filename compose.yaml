@@ -1,0 +1,652 @@
+# =============================================================================
+#  Weather platform — over-engineered edition.
+#
+#  Default `docker compose up -d` starts the CORE tier only:
+#     traefik, web, api, redis, postgres, worker
+#
+#  Opt-in tiers (compose profiles):
+#     --profile observability   Prometheus, Grafana, Loki, Promtail, exporters,
+#                               Alertmanager, Mailpit, Uptime Kuma
+#     --profile ops             Portainer, Watchtower, Adminer, Ofelia, backups
+#     --profile queue           dedicated RQ consumer
+#     --profile analytics       Umami
+#     --profile errors          GlitchTip
+#     --profile storage         MinIO
+# =============================================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-restart: &default-restart
+  restart: unless-stopped
+
+services:
+  # ------------------------------------------------------------------ proxy
+  traefik:
+    image: traefik:v3.7
+    container_name: weather-traefik
+    <<: *default-restart
+    logging: *default-logging
+    # Docker 29 requires API >= 1.40; pin the client so the provider negotiates.
+    environment:
+      DOCKER_API_VERSION: "1.44"
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./proxy/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./proxy/dynamic:/etc/traefik/dynamic:ro
+      - ./proxy/certs:/certs:ro
+    networks:
+      - edge
+      - observability
+    labels:
+      - "traefik.enable=false"
+
+  # -------------------------------------------------------------------- web
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    image: weather/web:local
+    container_name: weather-web
+    <<: *default-restart
+    logging: *default-logging
+    networks:
+      - edge
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.web.rule=Host(`weather.local`) || Host(`pi4.local`) || Host(`localhost`)"
+      - "traefik.http.routers.web.entrypoints=websecure"
+      - "traefik.http.routers.web.tls=true"
+      - "traefik.http.routers.web.priority=1"
+      - "traefik.http.routers.web.middlewares=secure-headers@file,compress@file"
+      - "traefik.http.services.web.loadbalancer.server.port=80"
+
+  # -------------------------------------------------------------------- API
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: weather/api:local
+    container_name: weather-api
+    <<: *default-restart
+    logging: *default-logging
+    env_file: [.env]
+    environment:
+      ENVIRONMENT: production
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-weather}:${POSTGRES_PASSWORD:-weather}@postgres:5432/${POSTGRES_DB:-weather}
+      RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS:-120}
+      RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW:-60}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - edge
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.api.rule=(Host(`weather.local`) || Host(`pi4.local`) || Host(`localhost`)) && PathPrefix(`/api`)"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.tls=true"
+      - "traefik.http.routers.api.priority=100"
+      - "traefik.http.routers.api.middlewares=secure-headers@file,compress@file,api-rate-limit@file"
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
+
+  # ------------------------------------------------------------------ redis
+  redis:
+    image: redis:7.4-alpine
+    container_name: weather-redis
+    <<: *default-restart
+    logging: *default-logging
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+      - data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # --------------------------------------------------------------- postgres
+  postgres:
+    image: postgres:16-alpine
+    container_name: weather-postgres
+    <<: *default-restart
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-weather}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-weather}
+      POSTGRES_DB: ${POSTGRES_DB:-weather}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - backups:/backups
+    networks:
+      - backend
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-weather} -d ${POSTGRES_DB:-weather}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------------- worker
+  worker:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: weather/api:local
+    container_name: weather-worker
+    <<: *default-restart
+    logging: *default-logging
+    command: ["python", "-m", "worker.main"]
+    env_file: [.env]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-weather}:${POSTGRES_PASSWORD:-weather}@postgres:5432/${POSTGRES_DB:-weather}
+      WORKER_CITIES: ${WORKER_CITIES:-Stockholm,London,New York,Tokyo,Paris}
+      WORKER_INTERVAL_SEC: ${WORKER_INTERVAL_SEC:-3600}
+      WORKER_HEALTH_PORT: "9000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  # ------------------------------------------------------- queue (profile)
+  queue:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: weather/api:local
+    container_name: weather-queue
+    profiles: ["queue"]
+    <<: *default-restart
+    logging: *default-logging
+    command: ["python", "-m", "worker.queue_worker"]
+    healthcheck:
+      disable: true
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://${POSTGRES_USER:-weather}:${POSTGRES_PASSWORD:-weather}@postgres:5432/${POSTGRES_DB:-weather}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+
+  # =================================================== observability tier
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: weather-prometheus
+    profiles: ["observability"]
+    <<: *default-restart
+    logging: *default-logging
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - edge
+      - backend
+      - observability
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.prometheus.rule=Host(`prometheus.local`)"
+      - "traefik.http.routers.prometheus.entrypoints=websecure"
+      - "traefik.http.routers.prometheus.tls=true"
+      - "traefik.http.routers.prometheus.middlewares=secure-headers@file,dashboard-auth@file"
+      - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: weather-grafana
+    profiles: ["observability"]
+    <<: *default-restart
+    logging: *default-logging
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: "https://grafana.local"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      TZ: ${TZ:-UTC}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - edge
+      - observability
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.local`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls=true"
+      - "traefik.http.routers.grafana.middlewares=secure-headers@file"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+
+  loki:
+    image: grafana/loki:3.2.1
+    container_name: weather-loki
+    profiles: ["observability"]
+    <<: *default-restart
+    logging: *default-logging
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    volumes:
+      - ./observability/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    networks:
+      - observability
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  promtail:
+    image: grafana/promtail:3.2.1
+    container_name: weather-promtail
+    profiles: ["observability"]
+    <<: *default-restart
+    logging: *default-logging
+    command: ["-config.file=/etc/promtail/promtail-config.yml"]
+    volumes:
+      - ./observability/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      - loki
+    networks:
+      - observability
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: weather-alertmanager
+    profiles: ["observability"]
+    <<: *default-restart
+    logging: *default-logging
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    volumes:
+      - ./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    networks:
+      - edge
+      - observability
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9093/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.alertmanager.rule=Host(`alertmanager.local`)"
+      - "traefik.http.routers.alertmanager.entrypoints=websecure"
+      - "traefik.http.routers.alertmanager.tls=true"
+      - "traefik.http.routers.alertmanager.middlewares=secure-headers@file,dashboard-auth@file"
+      - "traefik.http.services.alertmanager.loadbalancer.server.port=9093"
+
+  mailpit:
+    image: axllent/mailpit:v1.20
+    container_name: weather-mailpit
+    profiles: ["observability"]
+    <<: *default-restart
+    logging: *default-logging
+    environment:
+      MP_MAX_MESSAGES: "500"
+    networks:
+      - edge
+      - observability
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.mailpit.rule=Host(`mail.local`)"
+      - "traefik.http.routers.mailpit.entrypoints=websecure"
+      - "traefik.http.routers.mailpit.tls=true"
+      - "traefik.http.services.mailpit.loadbalancer.server.port=8025"
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: weather-node-exporter
+    profiles: ["observability"]
+    <<: *default-restart
+    logging: *default-logging
+    pid: host
+    command:
+      - "--path.rootfs=/host"
+    volumes:
+      - /:/host:ro,rslave
+    networks:
+      - observability
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: weather-cadvisor
+    profiles: ["observability"]
+    <<: *default-restart
+    logging: *default-logging
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      - observability
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    container_name: weather-redis-exporter
+    profiles: ["observability"]
+    <<: *default-restart
+    logging: *default-logging
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    networks:
+      - backend
+      - observability
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: weather-postgres-exporter
+    profiles: ["observability"]
+    <<: *default-restart
+    logging: *default-logging
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-weather}:${POSTGRES_PASSWORD:-weather}@postgres:5432/${POSTGRES_DB:-weather}?sslmode=disable
+    networks:
+      - backend
+      - observability
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: weather-uptime-kuma
+    profiles: ["observability"]
+    <<: *default-restart
+    logging: *default-logging
+    volumes:
+      - uptime_kuma_data:/app/data
+    networks:
+      - edge
+      - observability
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.status.rule=Host(`status.local`)"
+      - "traefik.http.routers.status.entrypoints=websecure"
+      - "traefik.http.routers.status.tls=true"
+      - "traefik.http.services.status.loadbalancer.server.port=3001"
+
+  # ============================================================ ops tier
+  portainer:
+    image: portainer/portainer-ce:2.21.5
+    container_name: weather-portainer
+    profiles: ["ops"]
+    <<: *default-restart
+    logging: *default-logging
+    command: ["-H", "unix:///var/run/docker.sock"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    networks:
+      - edge
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.portainer.rule=Host(`portainer.local`)"
+      - "traefik.http.routers.portainer.entrypoints=websecure"
+      - "traefik.http.routers.portainer.tls=true"
+      - "traefik.http.routers.portainer.middlewares=secure-headers@file"
+      - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    container_name: weather-watchtower
+    profiles: ["ops"]
+    <<: *default-restart
+    logging: *default-logging
+    # Monitor-only by default (no surprise updates). Add --interval + remove
+    # --monitor-only when you trust the stack.
+    command: ["--monitor-only", "--cleanup", "--interval", "3600"]
+    environment:
+      DOCKER_API_VERSION: "1.44"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - backend
+
+  adminer:
+    image: adminer:4.8.1
+    container_name: weather-adminer
+    profiles: ["ops"]
+    <<: *default-restart
+    logging: *default-logging
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    networks:
+      - edge
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.adminer.rule=Host(`db.local`)"
+      - "traefik.http.routers.adminer.entrypoints=websecure"
+      - "traefik.http.routers.adminer.tls=true"
+      - "traefik.http.routers.adminer.middlewares=secure-headers@file,dashboard-auth@file"
+      - "traefik.http.services.adminer.loadbalancer.server.port=8080"
+
+  ofelia:
+    image: mcuadros/ofelia:v0.3.6
+    container_name: weather-ofelia
+    profiles: ["ops"]
+    <<: *default-restart
+    logging: *default-logging
+    command: ["daemon", "--config=/etc/ofelia/config.ini"]
+    environment:
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./ops/ofelia/config.ini:/etc/ofelia/config.ini:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+
+  backup:
+    image: postgres:16-alpine
+    container_name: weather-backup
+    profiles: ["ops"]
+    <<: *default-restart
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-weather}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-weather}
+      POSTGRES_DB: ${POSTGRES_DB:-weather}
+      PGHOST: postgres
+      BACKUP_DIR: /backups
+      BACKUP_RETENTION: ${BACKUP_RETENTION:-14}
+    volumes:
+      - backups:/backups
+      - ./ops/backup/backup.sh:/backup/backup.sh:ro
+    command: ["sh", "-c", "/backup/backup.sh && sleep infinity"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+      - data
+
+  # ====================================================== analytics tier
+  umami:
+    image: ghcr.io/umami-software/umami:postgresql-latest
+    container_name: weather-umami
+    profiles: ["analytics"]
+    <<: *default-restart
+    logging: *default-logging
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-weather}:${POSTGRES_PASSWORD:-weather}@postgres:5432/umami
+      DATABASE_TYPE: postgresql
+      APP_SECRET: ${UMAMI_APP_SECRET:-change-me-umami}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - edge
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.umami.rule=Host(`analytics.local`)"
+      - "traefik.http.routers.umami.entrypoints=websecure"
+      - "traefik.http.routers.umami.tls=true"
+      - "traefik.http.services.umami.loadbalancer.server.port=3000"
+
+  # ========================================================= errors tier
+  glitchtip:
+    image: glitchtip/glitchtip:latest
+    container_name: weather-glitchtip
+    profiles: ["errors"]
+    <<: *default-restart
+    logging: *default-logging
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-weather}:${POSTGRES_PASSWORD:-weather}@postgres:5432/glitchtip
+      REDIS_URL: redis://redis:6379/1
+      SECRET_KEY: ${GLITCHTIP_SECRET_KEY:-change-me-glitchtip}
+      PORT: "8000"
+      EMAIL_URL: smtp://mailpit:1025
+      GLITCHTIP_DOMAIN: https://errors.local
+      DEFAULT_FROM_EMAIL: glitchtip@weather.local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - edge
+      - backend
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.glitchtip.rule=Host(`errors.local`)"
+      - "traefik.http.routers.glitchtip.entrypoints=websecure"
+      - "traefik.http.routers.glitchtip.tls=true"
+      - "traefik.http.services.glitchtip.loadbalancer.server.port=8000"
+
+  glitchtip-worker:
+    image: glitchtip/glitchtip:latest
+    container_name: weather-glitchtip-worker
+    profiles: ["errors"]
+    <<: *default-restart
+    logging: *default-logging
+    command: ["./bin/run-worker.sh"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-weather}:${POSTGRES_PASSWORD:-weather}@postgres:5432/glitchtip
+      REDIS_URL: redis://redis:6379/1
+      SECRET_KEY: ${GLITCHTIP_SECRET_KEY:-change-me-glitchtip}
+      EMAIL_URL: smtp://mailpit:1025
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+
+  # ======================================================== storage tier
+  minio:
+    image: cleanstart/minio:latest
+    container_name: weather-minio
+    profiles: ["storage"]
+    <<: *default-restart
+    logging: *default-logging
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    networks:
+      - edge
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.minio.rule=Host(`minio.local`)"
+      - "traefik.http.routers.minio.entrypoints=websecure"
+      - "traefik.http.routers.minio.tls=true"
+      - "traefik.http.routers.minio.middlewares=secure-headers@file"
+      - "traefik.http.services.minio.loadbalancer.server.port=9001"
+
+networks:
+  edge:
+    name: edge
+  backend:
+    name: backend
+  data:
+    name: data
+    internal: true
+  observability:
+    name: observability
+
+volumes:
+  redis_data:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  alertmanager_data:
+  uptime_kuma_data:
+  portainer_data:
+  minio_data:
+  backups:
