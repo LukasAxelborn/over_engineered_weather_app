@@ -125,6 +125,31 @@ make up-all    # everything (resource-hungry; mind the disk)
 
 ---
 
+## Re-deploy
+
+This repository is the source of truth, so you can rebuild the whole platform
+from a clean slate at any time with a single line:
+
+```sh
+make certs && make build && make up
+```
+
+- `make certs` — regenerates the local CA, the Traefik leaf certificate, and the
+  dashboard basic-auth file under `proxy/` (required whenever `proxy/certs/` was
+  removed or has expired).
+- `make build` — rebuilds the `web` and `api` images.
+- `make up` — starts the core tier.
+
+Add the optional tiers as needed by swapping the last target: `make up-obs`
+(observability), `make up-ops` (Portainer, Adminer, Ofelia, backups, Watchtower),
+or `make up-all` for everything.
+
+If `.env` is also missing (e.g. a fresh clone), run `make env` first and edit the
+passwords, then re-run the line above. To bring everything down again without
+losing data use `make down`; `make clean-all` also deletes volumes.
+
+---
+
 ## Endpoints
 
 Served by Traefik on `:443` (HTTP `:80` redirects to HTTPS). TLS is signed by the
